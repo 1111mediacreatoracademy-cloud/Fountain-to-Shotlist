@@ -4,6 +4,16 @@ import re
 import pandas as pd
 import streamlit as st
 
+# ---------- Helpers: normalize lines (strip Markdown/force dots) ----------
+def strip_md_markup(s: str) -> str:
+    if not s:
+        return s
+    s = s.strip()
+    s = re.sub(r'^\.+', '', s)           # leading dots (Fountain "force" syntax)
+    s = re.sub(r'^[\*\_`>]+', '', s)     # leading **, _, `, >
+    s = re.sub(r'[\*\_`]+$', '', s)      # trailing **, _ or `
+    return s.strip()
+
 # ---------- Reference column helper ----------
 def find_reference_columns_from_df(df0: pd.DataFrame):
     default_cols = [
@@ -17,19 +27,22 @@ def find_reference_columns_from_df(df0: pd.DataFrame):
     except Exception:
         return default_cols
 
-# ---------- Minimal Fountain Parser ----------
+# ---------- Minimal Fountain Parser (robust to Markdown styling) ----------
 SCENE_HEADING_RE = re.compile(r'^\s*(INT|EXT|INT/EXT|I/E)\.?\s', re.IGNORECASE)
-TRANSITION_RE = re.compile(r'^\s*[A-Z \t]+TO:\s*$')
+TRANSITION_RE = re.compile(r'^\s*[A-Z \t]+TO:\s*$', re.IGNORECASE)
 CHARACTER_RE = re.compile(r'^\s*[A-Z0-9 \-\(\)\'\.]+(?:\(.*\))?\s*$')
 
 def is_scene_heading(line: str) -> bool:
-    return bool(SCENE_HEADING_RE.match(line.strip()))
+    norm = strip_md_markup(line)
+    norm = re.sub(r'INT\./EXT\.', 'INT/EXT', norm, flags=re.IGNORECASE)
+    return bool(SCENE_HEADING_RE.match(norm))
 
 def is_transition(line: str) -> bool:
-    return bool(TRANSITION_RE.match(line.strip()))
+    norm = strip_md_markup(line)
+    return bool(TRANSITION_RE.match(norm))
 
 def is_character_cue(line: str) -> bool:
-    s = line.strip()
+    s = strip_md_markup(line)
     if not s or len(s) > 60:
         return False
     if is_scene_heading(s) or is_transition(s):
@@ -50,7 +63,7 @@ def parse_fountain_text(text: str):
     def flush_action_as_beat():
         nonlocal buffer_action
         if buffer_action:
-            t = " ".join(l.strip() for l in buffer_action if l.strip())
+            t = " ".join(strip_md_markup(l) for l in buffer_action if strip_md_markup(l))
             if t:
                 current_scene["beats"].append(("Action", t))
             buffer_action = []
@@ -63,7 +76,7 @@ def parse_fountain_text(text: str):
                 scenes.append(current_scene)
             current_scene = {
                 "scene_number": len(scenes) + 1,
-                "scene_heading": line.strip(),
+                "scene_heading": strip_md_markup(line.strip()),
                 "beats": [],
                 "characters": set()
             }
@@ -81,12 +94,12 @@ def parse_fountain_text(text: str):
 
         if is_character_cue(line):
             flush_action_as_beat()
-            current_character = line.strip()
+            current_character = strip_md_markup(line.strip())
             current_scene["characters"].add(current_character)
             continue
 
         if current_character:
-            txt = line.strip()
+            txt = strip_md_markup(line.strip())
             if txt:
                 current_scene["beats"].append(("Dialogue", f"{current_character}: {txt}"))
             continue
@@ -104,7 +117,7 @@ def parse_fountain_text(text: str):
     return scenes
 
 # ---------- Shotlist Builder ----------
-def build_shotlist_from_scenes(scenes, columns):
+def build_shotlist_from_scenes(scenes, columns, reset_per_scene=True):
     possible_map = {
         "Scene #": ["Scene #", "Scene", "Scene No", "Scene Number"],
         "Scene Heading": ["Scene Heading", "Heading", "Slugline"],
@@ -120,7 +133,7 @@ def build_shotlist_from_scenes(scenes, columns):
         "Notes": ["Notes"]
     }
     col_map = {}
-    columns = list(columns)  # copy
+    columns = list(columns)
     for logical, aliases in possible_map.items():
         match = None
         for alias in aliases:
@@ -136,19 +149,21 @@ def build_shotlist_from_scenes(scenes, columns):
                 columns.append(match)
         col_map[logical] = match
 
-    seen = set()
-    uniq_cols = []
+    seen = set(); uniq_cols = []
     for c in columns:
         if c not in seen:
-            uniq_cols.append(c)
-            seen.add(c)
+            uniq_cols.append(c); seen.add(c)
 
     rows = []
+    global_shot_counter = 1
+
     for sc in scenes:
         scene_num = sc["scene_number"]
         heading = sc["scene_heading"]
         char_list = ", ".join(sorted(sc["characters"])) if sc["characters"] else ""
-        shot_counter = 1
+
+        shot_counter = 1 if reset_per_scene else global_shot_counter
+
         for kind, beat_text in sc["beats"]:
             row = {c: "" for c in uniq_cols}
             row[col_map["Scene #"]] = scene_num
@@ -159,6 +174,7 @@ def build_shotlist_from_scenes(scenes, columns):
             row[col_map["Angle"]] = "Eye-level"
             row[col_map["Movement"]] = "Static"
             row[col_map["Lens"]] = "35mm"
+            # Location from heading
             loc = ""
             try:
                 head_no_prefix = re.sub(r'^\s*(INT|EXT|INT/EXT|I/E)\.?\s*', '', heading, flags=re.IGNORECASE)
@@ -169,17 +185,20 @@ def build_shotlist_from_scenes(scenes, columns):
             row[col_map["Characters"]] = char_list
             row[col_map["Notes"]] = ""
             rows.append(row)
-            shot_counter += 1
 
-    df = pd.DataFrame(rows, columns=uniq_cols)
-    return df
+            shot_counter += 1
+            global_shot_counter += 1
+
+    return pd.DataFrame(rows, columns=uniq_cols)
 
 # ---------- UI ----------
 st.set_page_config(page_title="Fountain ➜ Shotlist Converter", layout="wide")
 st.title("🎬 Fountain ➜ Shotlist Converter")
 st.write("Upload your screenplay in `.fountain`, optionally upload a reference Excel (to mirror columns), and download CSV/XLSX shotlists.")
 
+reset_per_scene = st.checkbox("Reset shot numbers per scene", value=True, help="If enabled, Shot # starts at 1 for each new scene heading (e.g., 'INT. HOSPICE ROOM - EVENING - LATER').")
 ref_file = st.file_uploader("Optional: Upload reference Excel to mirror column names", type=["xlsx"], key="ref")
+
 if ref_file is not None:
     try:
         ref_df = pd.read_excel(ref_file, sheet_name=0, header=0)
@@ -198,11 +217,11 @@ if up_files:
         name = upl.name
         text = upl.read().decode("utf-8", errors="ignore")
         scenes = parse_fountain_text(text)
-        df = build_shotlist_from_scenes(scenes, reference_columns)
+        df = build_shotlist_from_scenes(scenes, reference_columns, reset_per_scene=reset_per_scene)
         st.subheader(f"Shotlist Preview — {name} ({len(df)} rows)")
         st.dataframe(df.head(50), use_container_width=True)
 
-        # CSV buffer
+        # CSV download
         csv_buf = io.StringIO()
         df.to_csv(csv_buf, index=False)
         st.download_button(
@@ -212,7 +231,7 @@ if up_files:
             mime="text/csv",
         )
 
-        # XLSX buffer
+        # XLSX download
         xlsx_buf = io.BytesIO()
         with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Shotlist")
